@@ -1,9 +1,0 @@
-{
-  "name": "lastbell-multiplayer-server",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Relay server for the Last Bell co-op mode (rooms, message relay, WebRTC signalling for voice chat). No dependencies.",
-  "main": "server.js",
-  "scripts": { "start": "node server.js", "test": "node test.js" },
-  "engines": { "node": ">=18" }
-}
