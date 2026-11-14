@@ -12,6 +12,7 @@
  * Environment: PORT (8080), MAX_PLAYERS (4), ALLOWED_ORIGINS ("*" or e.g. "https://*.crazygames.com,https://my.site"),
  *              MAX_ROOMS (5000), MAX_CONN_PER_IP (30), TRUST_PROXY (1 = use X-Forwarded-For; set it behind Render/Fly/Caddy/nginx, otherwise every player looks like the proxy's IP), HOST_STALL_MS (6000),
  *              RATE_PER_SEC (80), RATE_BURST (200), DEBUG (1)
+ * Friends (friends.js): FRIENDS (0 = off), FRIENDS_MAX (30 friends per player), FRIENDS_MAX_ONLINE (20000), FRIENDS_BURST (20) / FRIENDS_RATE_PER_SEC (2), FRIEND_REQ_GAP_MS (60000), FRIEND_INVITE_GAP_MS (5000)
  * Lobby chat (all moderation runs HERE, a modified client cannot get around it - see chatfilter.js):
  *              CHAT (0 = no chat at all), CHAT_DEFAULT (text | quick | off: mode of a new room, the host can change it), CHAT_MAX_LEN (120), CHAT_MIN_GAP_MS (800), CHAT_BURST (6 messages per CHAT_WINDOW_MS 10000),
  *              CHAT_STRIKES (4 points -> muted; mild words 0, profanity 1, hate 2, links/contact data 1, spam 0.25; 1 point fades per CHAT_STRIKE_DECAY_MS 60000), CHAT_MUTE1_MS (60000), CHAT_MUTE2_MS (180000), the 3rd mute lasts for the rest of the stay,
@@ -21,6 +22,7 @@
 const http = require('http');
 const crypto = require('crypto');
 const chatFilter = require('./chatfilter.js').fromEnv();
+const friendsMod = require('./friends.js');
 
 const PROTO = 1;
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
@@ -48,6 +50,13 @@ const CFG = {
   penaltyMs: process.env.CHAT_IP_PENALTY_MS === '0' ? 0 : num(process.env.CHAT_IP_PENALTY_MS, 900000),
   reportsToMute: num(process.env.CHAT_REPORTS_TO_MUTE, 2),
   reportMuteMs: num(process.env.CHAT_REPORT_MUTE_MS, 300000),
+  friendsEnabled: process.env.FRIENDS !== '0',
+  friendsMax: num(process.env.FRIENDS_MAX, 30),
+  friendsMaxOnline: num(process.env.FRIENDS_MAX_ONLINE, 20000),
+  friendsBurst: num(process.env.FRIENDS_BURST, 20),
+  friendsRate: num(process.env.FRIENDS_RATE_PER_SEC, 2),
+  friendReqGapMs: num(process.env.FRIEND_REQ_GAP_MS, 60000),
+  friendInviteGapMs: num(process.env.FRIEND_INVITE_GAP_MS, 5000),
   origins: (process.env.ALLOWED_ORIGINS || '*').split(',').map(s => s.trim()).filter(Boolean),
 };
 const originRes = CFG.origins.map(o => (o === '*' ? null : new RegExp('^' + o.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^.]+(?:\\.[^.]+)*') + '$', 'i')));
@@ -124,7 +133,7 @@ class Conn {
 // ------------------------------------------------------------------ helpers
 const clean = (s, d) => { s = String(s == null ? '' : s).replace(/[\u0000-\u001f\u007f<>&"'`]/g, '').replace(/\s+/g, ' ').trim().slice(0, 20); return s || d; };
 function newCode() { for (let k = 0; k < 50; k++) { let c = ''; for (let i = 0; i < 4; i++) c += CODE_CHARS[crypto.randomInt(CODE_CHARS.length)]; if (!rooms.has(c)) return c; } return null; }
-const pub = p => ({ id: p.id, name: p.name, slot: p.slot, voice: !!p.voice, mic: !!p.mic, ready: !!p.ready, cg: !!p.cg, cm: isMuted(p) ? 1 : 0, hm: p.hostMuted ? 1 : 0 });
+const pub = p => ({ id: p.id, name: p.name, slot: p.slot, voice: !!p.voice, mic: !!p.mic, ready: !!p.ready, cg: !!p.cg, cm: isMuted(p) ? 1 : 0, hm: p.hostMuted ? 1 : 0, tt: p.tt });
 function pickHost(room) { let best = null; for (const q of room.players.values()) if (!best || q.joined < best.joined) best = q; return best ? best.id : 0; }
 function sendTo(room, id, obj) { const p = room.players.get(id); if (p) p.conn.send(obj); }
 function broadcast(room, obj, exceptId) { const f = frameText(JSON.stringify(obj)); for (const p of room.players.values()) if (p.id !== exceptId) p.conn.raw(f); }
@@ -132,31 +141,33 @@ function freeSlot(room) { const used = new Set([...room.players.values()].map(p 
 const roomState = room => ({ v: PROTO, room: room.code, host: room.hostId, max: room.max, cfg: room.cfg, open: room.open, chat: CFG.chatEnabled ? room.chat : undefined, players: [...room.players.values()].map(pub) });
 
 function addPlayer(conn, room, m) {
-  const slot = freeSlot(room), p = Object.assign({ id: room.nextId++, name: safeName(m.name, 'Spieler'), slot, conn, joined: Date.now(), voice: false, mic: false, ready: false, cg: !!m.cg }, newChatState(conn));
+  const slot = freeSlot(room), p = Object.assign({ id: room.nextId++, name: safeName(m.name, 'Spieler'), slot, conn, joined: Date.now(), voice: false, mic: false, ready: false, cg: !!m.cg, tt: titleIdx(m.tt) }, newChatState(conn));
   room.players.set(p.id, p); conn.player = p; conn.room = room;
   if (!room.hostId) { room.hostId = p.id; room.lastHostMsg = Date.now(); }
   conn.send(Object.assign({ t: 'joined', you: p.id }, roomState(room)));
   broadcast(room, { t: 'pjoin', p: pub(p) }, p.id);
   log('join', room.code, p.id, p.name, room.players.size + '/' + room.max);
+  FR.touchRoom(room);                                                             // friends of the players see the new room state
 }
 function removePlayer(conn, why) {
   const room = conn.room, p = conn.player; if (!room || !p) return;
   conn.room = null; conn.player = null; room.players.delete(p.id);
+  if (why !== 'disconnect') FR.touch(conn);                                      // friends see him as "online, no room" again
   if (!room.players.size) { rooms.delete(room.code); log('room closed', room.code); return; }
   let host = room.hostId; if (p.id === room.hostId) { host = room.hostId = pickHost(room); room.lastHostMsg = Date.now(); unmuteHost(room); }
   broadcast(room, { t: 'pleave', id: p.id, host, why: why || 'left' }, null);
-  log('leave', room.code, p.id, why || 'left');
+  log('leave', room.code, p.id, why || 'left'); FR.touchRoom(room);
 }
 function onClose(conn) {
   stats.conns--; const n = (ipCount.get(conn.ip) || 1) - 1; if (n <= 0) ipCount.delete(conn.ip); else ipCount.set(conn.ip, n);
-  removePlayer(conn, 'disconnect');
+  removePlayer(conn, 'disconnect'); FR.onClose(conn);
 }
 const err = (conn, code, msg) => conn.send({ t: 'err', code, msg });
 
 // ------------------------------------------------------------------ chat (lobby text chat). ALL moderation is decided here, never in the client.
 // Layers: room mode (text / quick phrases only / off, set by the host) -> the player's own switch (CrazyGames "disableChat") -> rate limit -> word / link / contact filter (chatfilter.js)
 //         -> strike points that lead to a mute (60 s, 180 s, then for the rest of the stay) -> reports of other players (2 different reporters = 5 min mute) -> host mute -> every player can block another one for himself.
-const QUICK_COUNT = 12;                                                         // quick phrases: the texts live in the client (so they are shown in the reader's language), the server only checks the index
+const QUICK_COUNT = 18;                                                         // quick phrases: the texts live in the client (so they are shown in the reader's language), the server only checks the index
 const FOREVER = Number.MAX_SAFE_INTEGER;
 function isMuted(p, t) { return !!p.hostMuted || p.until > (t || Date.now()); }
 const cerr = (conn, code, ms) => conn.send({ t: 'cerr', code, ms });
@@ -165,7 +176,9 @@ function newChatState(conn) {
   const pen = penalties.get(conn.ip), t = Date.now();
   return { chatOff: false, hostMuted: false, until: pen && pen > t ? FOREVER : 0, muteSent: false, points: 0, pointsAt: t, mutes: 0, lastMsgAt: 0, times: [], lastNorm: '', lastNormAt: 0, blocked: new Set(), reportedBy: new Set() };
 }
-const safeName = (s, d) => { const n = clean(s, d); return chatFilter.isCleanName(n) ? n : d; };      // names go through the word filter as well (CrazyGames user names, modified clients)
+const safeName = (s, d) => { const n = clean(s, d); return chatFilter.isCleanName(n) ? n : d; };
+const FR = friendsMod.create({ CFG, safeName });                               // friend IDs, presence, requests, invitations (friends.js)
+const titleIdx = v => (Number.isInteger(v) && v >= 0 && v < friendsMod.TITLE_COUNT ? v : -1);     // the shop title a player shows (index into the client's list, -1 = none)      // names go through the word filter as well (CrazyGames user names, modified clients)
 function chatState(room, p) { p.muteSent = isMuted(p); broadcast(room, { t: 'cstate', id: p.id, cm: p.muteSent ? 1 : 0, hm: p.hostMuted ? 1 : 0 }, null); }
 function unmuteHost(room) { const h = room.players.get(room.hostId); if (h && h.hostMuted) { h.hostMuted = false; chatState(room, h); } }
 /** violation points (they fade: 1 point per CHAT_STRIKE_DECAY_MS). Enough of them -> the player is muted, each time for longer. */
@@ -238,6 +251,7 @@ function onChatAdmin(room, me, m) {
 
 // ------------------------------------------------------------------ protocol
 function handle(conn, m) {
+  if (FR.is(m.t)) return FR.handle(conn, m);
   const room = conn.room, me = conn.player;
   switch (m.t) {
     case 'ping': return conn.send({ t: 'pong', ts: m.ts });
@@ -264,19 +278,19 @@ function handle(conn, m) {
   if (!room || !me) return;                                                       // everything below needs a room
   switch (m.t) {
     case 'info': {
-      if ('voice' in m) me.voice = !!m.voice; if ('mic' in m) me.mic = !!m.mic; if ('ready' in m) me.ready = !!m.ready; if ('name' in m) me.name = safeName(m.name, me.name);
-      return broadcast(room, { t: 'pinfo', id: me.id, name: me.name, voice: me.voice, mic: me.mic, ready: me.ready }, null);
+      if ('voice' in m) me.voice = !!m.voice; if ('mic' in m) me.mic = !!m.mic; if ('ready' in m) me.ready = !!m.ready; if ('name' in m) me.name = safeName(m.name, me.name); if ('tt' in m) me.tt = titleIdx(m.tt);
+      return broadcast(room, { t: 'pinfo', id: me.id, name: me.name, voice: me.voice, mic: me.mic, ready: me.ready, tt: me.tt }, null);
     }
     case 'cfg': {
       if (me.id !== room.hostId || !m.cfg || typeof m.cfg !== 'object') return;
       const c = room.cfg, n = m.cfg;
       if (Number.isInteger(n.day) && n.day >= 0 && n.day < 20) c.day = n.day;
       if (Number.isInteger(n.diff) && n.diff >= 0 && n.diff <= 2) c.diff = n.diff;
-      if (n.state === 'lobby' || n.state === 'play' || n.state === 'end') { c.state = n.state; room.lastHostMsg = Date.now(); }
+      if (n.state === 'lobby' || n.state === 'play' || n.state === 'end') { if (c.state !== n.state) { c.state = n.state; FR.touchRoom(room); } room.lastHostMsg = Date.now(); }
       if (Number.isInteger(n.round) && n.round >= 0) c.round = n.round;
       return broadcast(room, { t: 'cfg', cfg: c }, null);
     }
-    case 'open': { if (me.id === room.hostId) room.open = !!m.open; return; }
+    case 'open': { if (me.id === room.hostId) { room.open = !!m.open; FR.touchRoom(room); } return; }
     case 'kick': {
       if (me.id !== room.hostId || m.id === me.id) return; const p = room.players.get(m.id); if (!p) return;
       p.conn.send({ t: 'kicked' }); removePlayer(p.conn, 'kicked'); return;
@@ -301,7 +315,7 @@ const server = http.createServer((req, res) => {
   if (req.url === '/health' || req.url.startsWith('/health?')) {
     let players = 0; rooms.forEach(r => { players += r.players.size; });
     res.writeHead(200, Object.assign({ 'Content-Type': 'application/json' }, h));
-    return res.end(JSON.stringify({ ok: true, proto: PROTO, rooms: rooms.size, players, uptime: Math.round((Date.now() - stats.started) / 1000), maxPlayers: CFG.maxPlayers, chat: CFG.chatEnabled }));
+    return res.end(JSON.stringify({ ok: true, proto: PROTO, rooms: rooms.size, players, uptime: Math.round((Date.now() - stats.started) / 1000), maxPlayers: CFG.maxPlayers, chat: CFG.chatEnabled, friends: CFG.friendsEnabled }));
   }
   res.writeHead(200, Object.assign({ 'Content-Type': 'text/plain; charset=utf-8' }, h)); res.end('Last Bell multiplayer server is running.\n');
 });
@@ -348,4 +362,4 @@ process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
 if (require.main === module) {
   server.listen(CFG.port, () => console.log('Last Bell multiplayer server listening on :' + CFG.port + '  (max ' + CFG.maxPlayers + ' players per room, origins: ' + CFG.origins.join(', ') + ')'));
 }
-module.exports = { server, rooms, CFG, PROTO, shutdown, chatFilter };
+module.exports = { server, rooms, CFG, PROTO, shutdown, chatFilter, friends: FR };

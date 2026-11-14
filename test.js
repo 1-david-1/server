@@ -324,5 +324,101 @@ const get = (port, p) => new Promise((res, rej) => http.get({ port, host: '127.0
     });
   } finally { S6.stop(); }
 
+  // ================================================================== friends (IDs, presence, requests, invitations)
+  const nodeCrypto = require('crypto'), FRM = require('./friends.js');
+  const identity = () => { const kp = nodeCrypto.generateKeyPairSync('ec', { namedCurve: 'P-256' }), jwk = kp.publicKey.export({ format: 'jwk' }); const raw = Buffer.concat([Buffer.from([4]), Buffer.from(jwk.x, 'base64url'), Buffer.from(jwk.y, 'base64url')]); return { priv: kp.privateKey, pub: raw.toString('base64url'), pid: FRM.pidOf(raw) }; };
+  const signFor = (id, n) => nodeCrypto.sign('sha256', Buffer.from('LB1:' + n), { key: id.priv, dsaEncoding: 'ieee-p1363' }).toString('base64url');
+  const login = async (c, id) => { c.send({ t: 'fauth', pub: id.pub }); const ch = await c.wait(m => m.t === 'fchal'); c.send({ t: 'fproof', sig: signFor(id, ch.n) }); return c.wait(m => m.t === 'fok'); };
+  const fcl = async (port, id, ids, name, tt) => { const c = await client(port); c.id = id; const ok = await login(c, id); assert.strictEqual(ok.pid, id.pid); c.send({ t: 'flist', ids, name: name || 'Fritz', tt }); await c.wait(m => m.t === 'fall'); return c; };
+  const freqs = c => c.msgs.filter(m => m.t === 'freq'), pres = (c, pid) => c.msgs.filter(m => m.t === 'fpres' && m.pid === pid);
+
+  const S7 = await startServer({});
+  try {
+    await t('friends: the ID is derived from the public key (10 Crockford characters) and login needs a valid signature', async () => {
+      const a = identity(); assert.ok(FRM.PID_RE.test(a.pid), a.pid);
+      const c = await client(S7.port); const ok = await login(c, a); assert.strictEqual(ok.pid, a.pid);
+      const d = await client(S7.port), mallory = identity(); d.send({ t: 'fauth', pub: a.pub }); const ch = await d.wait(m => m.t === 'fchal'); d.send({ t: 'fproof', sig: signFor(mallory, ch.n) });
+      assert.strictEqual((await d.wait(m => m.t === 'ferr')).code, 'auth');
+      d.send({ t: 'flist', ids: [] }); assert.strictEqual((await d.wait(m => m.t === 'ferr')).code, 'auth');                      // not logged in: nothing works
+      const e = await client(S7.port); e.send({ t: 'fauth', pub: 'nonsense' }); assert.strictEqual((await e.wait(m => m.t === 'ferr')).code, 'key');
+      e.send({ t: 'fauth', pub: Buffer.concat([Buffer.from([4]), Buffer.alloc(64, 7)]).toString('base64url') }); assert.strictEqual((await e.wait(m => m.t === 'ferr')).code, 'key');   // not a point on the curve
+      e.send({ t: 'fproof', sig: 'AAAA' }); assert.strictEqual((await e.wait(m => m.t === 'ferr')).code, 'auth');
+      for (const x of [c, d, e]) x.ws.close(); await sleep(100);
+    });
+    await t('friends: a signature cannot be replayed (the challenge is used up)', async () => {
+      const a = identity(), c = await client(S7.port); c.send({ t: 'fauth', pub: a.pub }); const ch = await c.wait(m => m.t === 'fchal'), sig = signFor(a, ch.n); c.send({ t: 'fproof', sig }); await c.wait(m => m.t === 'fok');
+      const d = await client(S7.port); d.send({ t: 'fauth', pub: a.pub }); await d.wait(m => m.t === 'fchal'); d.send({ t: 'fproof', sig }); assert.strictEqual((await d.wait(m => m.t === 'ferr')).code, 'auth');
+      c.ws.close(); d.ws.close(); await sleep(100);
+    });
+    let A, B, ia = identity(), ib = identity();
+    await t('friends: adding somebody shows nothing about him - he only gets a request (name, no presence either way)', async () => {
+      B = await fcl(S7.port, ib, [], 'Berta'); A = await fcl(S7.port, ia, [ib.pid], 'Anton');
+      const rq = await B.wait(m => m.t === 'freq'); assert.strictEqual(rq.from, ia.pid); assert.strictEqual(rq.name, 'Anton');
+      await sleep(150); assert.deepStrictEqual(A.msgs.filter(m => m.t === 'fpres'), []); assert.deepStrictEqual(B.msgs.filter(m => m.t === 'fpres'), []);
+      assert.ok(!A.msgs.some(m => m.t === 'fall' && m.list.length));                                                                 // A learns nothing about B (not even that he is online)
+    });
+    await t('friends: when both added each other they see each other online', async () => {
+      B.send({ t: 'flist', ids: [ia.pid], name: 'Berta' }); const all = await B.wait(m => m.t === 'fall'); assert.strictEqual(all.list.length, 1); assert.strictEqual(all.list[0].pid, ia.pid); assert.strictEqual(all.list[0].st, 'on'); assert.strictEqual(all.list[0].name, 'Anton');
+      const p = await A.wait(m => m.t === 'fpres' && m.pid === ib.pid); assert.strictEqual(p.st, 'on'); assert.strictEqual(p.name, 'Berta');
+    });
+    await t('friends: presence follows the room - lobby with its code, playing, back to online, offline', async () => {
+      A.send({ t: 'create', v: 1, name: 'Anton' }); const j = await A.wait(m => m.t === 'joined'); const lob = await B.wait(m => m.t === 'fpres' && m.pid === ia.pid && m.st === 'lobby'); assert.strictEqual(lob.room, j.room);
+      A.send({ t: 'cfg', cfg: { state: 'play' } }); assert.strictEqual((await B.wait(m => m.t === 'fpres' && m.pid === ia.pid && m.st === 'play')).room, j.room);
+      A.send({ t: 'open', open: false }); const closed = await B.wait(m => m.t === 'fpres' && m.pid === ia.pid && m.room === undefined); assert.strictEqual(closed.st, 'play');            // a closed room has no code to join
+      A.send({ t: 'leave' }); await B.wait(m => m.t === 'fpres' && m.pid === ia.pid && m.st === 'on');
+      A.ws.close(); const off = await B.wait(m => m.t === 'fpres' && m.pid === ia.pid && m.st === 'off'); assert.strictEqual(off.st, 'off');
+    });
+    await t('friends: invitations only between mutual friends who are online, only from an open room, and not in a flood', async () => {
+      A = await fcl(S7.port, ia, [ib.pid], 'Anton'); await B.wait(m => m.t === 'fpres' && m.pid === ia.pid && m.st === 'on');
+      A.send({ t: 'finv', to: ib.pid }); await sleep(150); assert.ok(!B.msgs.some(m => m.t === 'finv'), 'invited without a room');
+      A.send({ t: 'create', v: 1, name: 'Anton' }); const j = await A.wait(m => m.t === 'joined'); await sleep(100);
+      A.send({ t: 'finv', to: ib.pid }); const inv = await B.wait(m => m.t === 'finv'); assert.strictEqual(inv.from, ia.pid); assert.strictEqual(inv.room, j.room); assert.strictEqual(inv.name, 'Anton'); await A.wait(m => m.t === 'fack');
+      A.send({ t: 'finv', to: ib.pid }); assert.strictEqual((await A.wait(m => m.t === 'ferr')).code, 'rate');
+      const stranger = await fcl(S7.port, identity(), [ia.pid], 'Stranger'); A.send({ t: 'finv', to: 'ZZZZZZZZZZ' }); await sleep(150); assert.ok(!stranger.msgs.some(m => m.t === 'finv'));
+      stranger.ws.close(); A.ws.close(); await sleep(100);
+    });
+    await t('friends: a declined / blocked sender cannot send requests any more', async () => {
+      const ic = identity(), C = await fcl(S7.port, ic, [], 'Cora'), D = await fcl(S7.port, identity(), [], 'Dirk');
+      C.send({ t: 'fblock', id: ia.pid, on: true }); await sleep(100); const E2 = await fcl(S7.port, ia, [ic.pid], 'Anton'); await sleep(200); assert.strictEqual(freqs(C).length, 0, 'blocked request arrived');
+      C.send({ t: 'fblock', id: ia.pid, on: false }); await sleep(100); E2.send({ t: 'flist', ids: [], name: 'Anton' }); E2.send({ t: 'flist', ids: [ic.pid, 'ABCDEFGHJK'], name: 'Anton' }); await sleep(250);          // only a NEWLY added ID causes a request assert.strictEqual(freqs(C).length, 1, 'unblocked request did not arrive');
+      E2.send({ t: 'flist', ids: [ib.pid], name: 'Anton' }); E2.send({ t: 'flist', ids: [ib.pid, ic.pid], name: 'Anton' }); await sleep(150); assert.strictEqual(freqs(C).length, 1, 'same request twice within the gap');
+      for (const x of [C, D, E2]) x.ws.close(); await sleep(100);
+    });
+    await t('friends: a request waits for somebody who is not online yet and arrives when he logs in', async () => {
+      const ix = identity(), iy = identity(), X = await fcl(S7.port, ix, [iy.pid], 'Xaver');                              // Y is offline
+      const Y = await fcl(S7.port, iy, [], 'Yvonne'); const rq = await Y.wait(m => m.t === 'freq'); assert.strictEqual(rq.from, ix.pid); assert.strictEqual(rq.name, 'Xaver');
+      X.ws.close(); Y.ws.close(); await sleep(100);
+    });
+    await t('friends: the same browser in a second tab replaces the first connection, the friend sees it go offline and back', async () => {
+      const A1 = await fcl(S7.port, ia, [ib.pid], 'Anton'); await B.wait(m => m.t === 'fpres' && m.pid === ia.pid && m.st === 'on'); B.msgs.length = 0;
+      const A2 = await fcl(S7.port, ia, [ib.pid], 'Anton2'); await A1.wait(m => m.t === 'fdup'); const back = await B.wait(m => m.t === 'fpres' && m.pid === ia.pid && m.st === 'on' && m.name === 'Anton2'); assert.strictEqual(back.name, 'Anton2');
+      B.msgs.length = 0; A1.send({ t: 'flist', ids: [ib.pid] }); A1.send({ t: 'finfo', name: 'Hijack' }); await sleep(150); assert.ok(!B.msgs.some(m => m.name === 'Hijack'), 'the replaced connection still spoke for the ID');
+      A1.ws.close(); await sleep(150); assert.ok(!B.msgs.some(m => m.t === 'fpres' && m.pid === ia.pid && m.st === 'off'), 'the old tab closing took the new one offline'); A2.ws.close(); await sleep(100);
+    });
+    await t('friends: names go through the word filter, the title index is checked, fbye logs out without closing', async () => {
+      const A3 = await fcl(S7.port, ia, [ib.pid], 'Arschloch', 99); const p1 = await B.wait(m => m.t === 'fpres' && m.pid === ia.pid && m.st === 'on'); assert.strictEqual(p1.name, 'Spieler'); assert.strictEqual(p1.tt, -1);
+      A3.send({ t: 'finfo', name: 'Anton', tt: 3 }); const p2 = await B.wait(m => m.t === 'fpres' && m.pid === ia.pid && m.tt === 3); assert.strictEqual(p2.name, 'Anton');
+      A3.send({ t: 'fbye' }); await B.wait(m => m.t === 'fpres' && m.pid === ia.pid && m.st === 'off'); A3.send({ t: 'ping', ts: 5 }); await A3.wait(m => m.t === 'pong'); A3.send({ t: 'flist', ids: [] }); assert.strictEqual((await A3.wait(m => m.t === 'ferr')).code, 'auth');
+      A3.ws.close(); await sleep(100);
+    });
+    await t('friends: shop titles travel with the room players (validated)', async () => {
+      const c = await client(S7.port); c.send({ t: 'create', v: 1, name: 'Tina', tt: 2 }); const j = await c.wait(m => m.t === 'joined'); assert.strictEqual(j.players[0].tt, 2);
+      const d = await client(S7.port); d.send({ t: 'join', v: 1, room: j.room, name: 'Tom', tt: 77 }); const jd = await d.wait(m => m.t === 'joined'); assert.strictEqual(jd.players.find(p => p.id === jd.you).tt, -1);
+      d.send({ t: 'info', tt: 5 }); const pi = await c.wait(m => m.t === 'pinfo' && m.tt === 5); assert.strictEqual(pi.tt, 5); c.ws.close(); d.ws.close(); await sleep(100);
+    });
+    await t('friends: quick phrases 12-17 (the shop pack) are accepted, 18 is not', async () => {
+      const c = await client(S7.port); c.send({ t: 'create', v: 1, name: 'Qu' }); await c.wait(m => m.t === 'joined'); await sleep(900); c.send({ t: 'chat', q: 17 }); assert.strictEqual((await c.wait(m => m.t === 'chat')).q, 17);
+      await sleep(900); c.send({ t: 'chat', q: 18 }); await sleep(200); assert.ok(!c.msgs.some(m => m.t === 'chat' && m.q === 18)); c.ws.close(); await sleep(100);
+    });
+    await t('friends: an ID that is offline does not exist for the others (health shows no IDs)', async () => { const h = JSON.parse((await get(S7.port, '/health')).body); assert.strictEqual(h.friends, true); assert.ok(!JSON.stringify(h).includes(ia.pid)); });
+    for (const c of [A, B]) { try { c.ws.close(); } catch (e) { /* ignore */ } } await sleep(100);
+  } finally { S7.stop(); }
+  const S8 = await startServer({ FRIENDS: '0' });
+  try {
+    await t('friends: FRIENDS=0 switches the feature off (every friend message is answered with ferr off)', async () => {
+      const c = await client(S8.port); c.send({ t: 'fauth', pub: identity().pub }); assert.strictEqual((await c.wait(m => m.t === 'ferr')).code, 'off'); c.ws.close(); await sleep(100);
+    });
+  } finally { S8.stop(); }
+
   console.log('\n' + pass + ' passed, ' + fail + ' failed'); process.exit(fail ? 1 : 0);
 })().catch(e => { console.error(e); process.exit(2); });
